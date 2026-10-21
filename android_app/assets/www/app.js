@@ -4937,23 +4937,10 @@ function initAppUpdater() {
     verLabel.textContent = `v${current.versionName} (Сборка ${current.versionCode})`;
   }
 
+  // Updates are disabled in this fork: upstream APKs are signed with a
+  // different key and cannot be installed over this build.
   const btnCheck = document.getElementById('btn-check-update');
-  if (btnCheck) {
-    btnCheck.addEventListener('click', () => {
-      checkForUpdates(true);
-    });
-  }
-
-  // Automatic background update check with 6h throttle
-  setTimeout(() => {
-    const lastCheck = parseInt(localStorage.getItem('ym_last_update_check') || '0', 10);
-    const now = Date.now();
-    const sixHours = 6 * 60 * 60 * 1000;
-    if (now - lastCheck > sixHours) {
-      localStorage.setItem('ym_last_update_check', now.toString());
-      checkForUpdates(false);
-    }
-  }, 3500);
+  if (btnCheck) btnCheck.style.display = 'none';
 }
 
 // ==========================================

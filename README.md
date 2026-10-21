@@ -1,5 +1,11 @@
 # YM Liberty (Android)
 
+> **Форк с рабочей сборкой.** Релиз v1.1.0 в оригинальном репозитории падает при запуске на любом устройстве
+> (`java.lang.VerifyError` в `AndroidBridge`). В исходниках это уже исправлено, но новый релиз не выпущен.
+> Здесь — APK, собранный из актуальных исходников (1.1.34) с отключённым автообновлением:
+> [**Скачать из Releases**](https://github.com/DverkaSK/ym-liberty-android/releases/latest).
+> Сборка подписана другим ключом, поэтому перед установкой удалите версию из оригинального репозитория.
+
 <p align="center">
   <img src="android_app/assets/www/favicon.png" width="100" height="100" alt="YM Liberty Logo" />
 </p>
