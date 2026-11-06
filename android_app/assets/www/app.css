@@ -8,7 +8,8 @@
   --accent-hover: #e0e0e0;
   --danger-color: #e63946;
   --nav-base-height: 56px;
-  --safe-bottom: env(safe-area-inset-bottom, 0px);
+  /* WebView's env() does not report the Android nav bar; app.js injects it. */
+  --safe-bottom: max(env(safe-area-inset-bottom, 0px), var(--android-nav-inset, 0px));
   --nav-height: calc(var(--nav-base-height) + var(--safe-bottom));
   --mini-player-height: 60px;
 }
@@ -2505,7 +2506,8 @@ input[type=range]::-webkit-slider-thumb {
   --control-height: 44px;
   --nav-base-height: 64px;
   --safe-top: env(safe-area-inset-top, 0px);
-  --safe-bottom: env(safe-area-inset-bottom, 0px);
+  /* WebView's env() does not report the Android nav bar; app.js injects it. */
+  --safe-bottom: max(env(safe-area-inset-bottom, 0px), var(--android-nav-inset, 0px));
   --nav-height: calc(var(--nav-base-height) + var(--safe-bottom));
   --mini-player-height: 64px;
   --shadow-card: 0 14px 36px rgba(0, 0, 0, .24);
@@ -3446,4 +3448,9 @@ body::-webkit-scrollbar {
   #view-vibe .vibe-container {
     padding-top: calc(var(--safe-top) + 92px);
   }
+}
+
+/* Native-only settings rows stay hidden in a plain browser. */
+.setting-item.hidden {
+  display: none;
 }

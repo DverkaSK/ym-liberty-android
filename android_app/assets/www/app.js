@@ -1469,7 +1469,16 @@ window.handleAndroidBack = function() {
       return true;
     }
 
-    // 5. On the main tab: let the system handle it (minimise the app).
+    // 5. On another root tab: return to the Wave first.
+    if (activeView && activeView.id !== 'view-vibe') {
+      const vibeBtn = document.querySelector('.nav-btn[data-target="view-vibe"]');
+      if (vibeBtn) {
+        vibeBtn.click();
+        return true;
+      }
+    }
+
+    // 6. On the Wave tab: let the native side minimise the app.
     return false;
   } catch (e) {
     console.warn('handleAndroidBack error:', e);
@@ -2994,6 +3003,56 @@ dom.toggleDynamicBg.addEventListener('change', () => {
   syncDynamicBackground();
 });
 
+// --- Android navigation bar (Back / Home / Recents) ---
+// The window extends under the nav bar, and WebView's env(safe-area-inset-bottom)
+// does not include it, so the bottom tabs ended up under the system buttons.
+// The real inset comes from the native bridge into --android-nav-inset; the bar
+// can also be hidden entirely (immersive mode, swipe up to reveal it).
+const HIDE_SYSTEM_NAV_KEY = 'ym_hide_system_nav';
+const hasNavBridge = !!(window.AndroidBridge && typeof window.AndroidBridge.getNavBarInset === 'function');
+
+function isSystemNavHidden() {
+  try { return localStorage.getItem(HIDE_SYSTEM_NAV_KEY) === '1'; } catch (e) { return false; }
+}
+
+function applySystemNavInset() {
+  let inset = 0;
+  if (hasNavBridge && !isSystemNavHidden()) {
+    try { inset = Math.max(0, Number(window.AndroidBridge.getNavBarInset()) || 0); } catch (e) {}
+  }
+  document.documentElement.style.setProperty('--android-nav-inset', inset + 'px');
+}
+
+function applySystemNavMode() {
+  if (hasNavBridge && typeof window.AndroidBridge.setSystemNavHidden === 'function') {
+    try { window.AndroidBridge.setSystemNavHidden(isSystemNavHidden()); } catch (e) {}
+  }
+  // Insets settle asynchronously after the bar is shown/hidden.
+  applySystemNavInset();
+  setTimeout(applySystemNavInset, 300);
+  setTimeout(applySystemNavInset, 1200);
+}
+
+(function initSystemNav() {
+  if (!hasNavBridge) return;
+  const row = document.getElementById('setting-hide-system-nav');
+  const toggle = document.getElementById('toggle-hide-system-nav');
+  if (row) row.classList.remove('hidden');
+  if (toggle) {
+    toggle.checked = isSystemNavHidden();
+    toggle.addEventListener('change', () => {
+      try { localStorage.setItem(HIDE_SYSTEM_NAV_KEY, toggle.checked ? '1' : '0'); } catch (e) {}
+      applySystemNavMode();
+    });
+  }
+  applySystemNavMode();
+  window.addEventListener('resize', applySystemNavInset);
+  // Older Android drops immersive mode when the app goes to the background.
+  document.addEventListener('visibilitychange', () => {
+    if (!document.hidden) applySystemNavMode();
+  });
+})();
+
 // Color Picker Logic
 const ACCENT_COLOR_KEY = 'ym_accent_color';
 function applyAccentColor(color) {
@@ -3897,6 +3956,15 @@ let syncRetries = 0;
 // Set when the account-side stats sync is known to be failing, so the UI can
 // stop pretending the counters are safe in the cloud.
 let statsSyncFailed = false;
+// The counters have two cloud copies: the YM Liberty server (primary) and the
+// title of the hidden Wave-history playlist on the Yandex account (fallback).
+// *.vercel.app is unreachable from many Russian networks while Yandex itself
+// always is, so the warning is only raised when BOTH copies fail.
+let serverStatsOk = null;   // null = not tried yet
+let accountStatsOk = null;
+let lastAccountStatsWrite = 0;
+let syncPlaylistTitle = null;
+const ACCOUNT_STATS_WRITE_INTERVAL = 60000;
 let lastAudioSampleTime = null;
 let lastAudioCurrentTrackId = null;
 
@@ -4113,28 +4181,83 @@ async function syncStatsFromServer() {
       return;
     }
 
-    const local = getWaveStats();
-    const today = new Date().toISOString().slice(0, 10);
-
-    local.totalTracks = Math.max(local.totalTracks || 0, remote.totalTracks || 0);
-    local.totalSeconds = Math.max(local.totalSeconds || 0, remote.totalSeconds || 0);
-    if (remote.date === today) {
-      local.todayTracks = Math.max(local.todayTracks || 0, remote.todayTracks || 0);
-      local.todaySeconds = Math.max(local.todaySeconds || 0, remote.todaySeconds || 0);
-    }
-    saveWaveStats(local);
-    updateWaveStatsDisplay();
+    mergeRemoteStats(remote);
 
     // The local copy may have been ahead (e.g. listening happened offline), so
     // write the merged result back rather than only pulling.
     await pushStatsToServer(uid);
-
-    if (statsSyncFailed) ylog('SYNC', 'server stats sync recovered');
-    statsSyncFailed = false;
   } catch (e) {
     ylogError('SYNC', 'read stats from server failed: ' + (e && e.message ? e.message : e));
-    statsSyncFailed = true;
+    serverStatsOk = false;
+    refreshStatsSyncFlag();
   }
+}
+
+// Fold a cloud copy into the local counters (max wins, so no copy can roll the
+// numbers back).
+function mergeRemoteStats(remote) {
+  if (!remote) return;
+  const local = getWaveStats();
+  const today = new Date().toISOString().slice(0, 10);
+  local.totalTracks = Math.max(local.totalTracks || 0, remote.totalTracks || 0);
+  local.totalSeconds = Math.max(local.totalSeconds || 0, remote.totalSeconds || 0);
+  if (remote.date === today) {
+    local.todayTracks = Math.max(local.todayTracks || 0, remote.todayTracks || 0);
+    local.todaySeconds = Math.max(local.todaySeconds || 0, remote.todaySeconds || 0);
+  }
+  saveWaveStats(local);
+  updateWaveStatsDisplay();
+}
+
+function refreshStatsSyncFlag() {
+  const failed = serverStatsOk === false && accountStatsOk !== true;
+  if (statsSyncFailed && !failed) ylog('SYNC', 'stats sync recovered (server=' + serverStatsOk + ', account=' + accountStatsOk + ')');
+  statsSyncFailed = failed;
+  updateWaveStatsDisplay();
+}
+
+// Title format: _ym_stats:wave-history|totalTracks:totalSeconds:date:todayTracks:todaySeconds
+function encodeAccountStatsTitle(stats) {
+  return STATS_PLAYLIST_PREFIX + 'wave-history|' + [
+    Math.floor(stats.totalTracks || 0),
+    Math.floor(stats.totalSeconds || 0),
+    stats.date || new Date().toISOString().slice(0, 10),
+    Math.floor(stats.todayTracks || 0),
+    Math.floor(stats.todaySeconds || 0)
+  ].join(':');
+}
+
+function parseAccountStatsTitle(title) {
+  const m = /\|(\d+):(\d+):(\d{4}-\d{2}-\d{2}):(\d+):(\d+)$/.exec(title || '');
+  if (!m) return null;
+  return {
+    totalTracks: +m[1], totalSeconds: +m[2], date: m[3],
+    todayTracks: +m[4], todaySeconds: +m[5]
+  };
+}
+
+async function pushStatsToAccount(force = false) {
+  if (!state.token || !syncPlaylistKind || !YandexClient.renamePlaylist) return false;
+  const now = Date.now();
+  if (!force && now - lastAccountStatsWrite < ACCOUNT_STATS_WRITE_INTERVAL) return accountStatsOk === true;
+  const title = encodeAccountStatsTitle(getWaveStats());
+  if (title === syncPlaylistTitle) {
+    accountStatsOk = true;
+    refreshStatsSyncFlag();
+    return true;
+  }
+  lastAccountStatsWrite = now;
+  try {
+    const res = await YandexClient.renamePlaylist(syncPlaylistKind, title, state.token);
+    if (!res) throw new Error('empty rename response');
+    syncPlaylistTitle = title;
+    accountStatsOk = true;
+  } catch (e) {
+    ylogError('SYNC', 'write stats to account failed: ' + (e && e.message ? e.message : e));
+    accountStatsOk = false;
+  }
+  refreshStatsSyncFlag();
+  return accountStatsOk;
 }
 
 async function pushStatsToServer(uidHint) {
@@ -4153,20 +4276,21 @@ async function pushStatsToServer(uidHint) {
       todaySeconds: stats.todaySeconds || 0,
       date: stats.date || new Date().toISOString().slice(0, 10)
     });
-    if (statsSyncFailed) ylog('SYNC', 'server stats sync recovered');
-    statsSyncFailed = false;
-    updateWaveStatsDisplay();
+    serverStatsOk = true;
+    refreshStatsSyncFlag();
     return true;
   } catch (e) {
     ylogError('SYNC', 'write stats to server failed: ' + (e && e.message ? e.message : e));
-    statsSyncFailed = true;
-    updateWaveStatsDisplay();
+    serverStatsOk = false;
+    // Server unreachable: keep the counters safe in the Yandex account instead.
+    await pushStatsToAccount();
+    refreshStatsSyncFlag();
     return false;
   }
 }
 
 // Resolve (creating it if needed) the hidden account playlist that stores the
-// Wave history. Its title carries no counters — only the marker prefix.
+// Wave history. Its title also carries the fallback copy of the counters.
 async function syncWaveHistoryPlaylist() {
   if (!state.token || !YandexClient.getUserPlaylistsRaw) return;
   try {
@@ -4174,6 +4298,15 @@ async function syncWaveHistoryPlaylist() {
     const statPl = (playlists || []).find(p => p.title && p.title.startsWith(STATS_PLAYLIST_PREFIX));
     if (statPl) {
       syncPlaylistKind = statPl.kind;
+      syncPlaylistTitle = statPl.title;
+      const accountCopy = parseAccountStatsTitle(statPl.title);
+      if (accountCopy) {
+        mergeRemoteStats(accountCopy);
+        accountStatsOk = true;
+      }
+      // Without the server, the account copy is the only cloud backup.
+      if (serverStatsOk === false) await pushStatsToAccount(true);
+      else refreshStatsSyncFlag();
 
       // Restore previously played Wave tracks so the Wave never repeats after a reinstall
       if (YandexClient.getPlaylist) {
@@ -4201,7 +4334,9 @@ async function syncWaveHistoryPlaylist() {
     const created = await YandexClient.createPrivatePlaylist(STATS_PLAYLIST_PREFIX + 'wave-history', state.token);
     if (created && created.kind) {
       syncPlaylistKind = created.kind;
+      syncPlaylistTitle = STATS_PLAYLIST_PREFIX + 'wave-history';
       ylog('SYNC', 'created wave history playlist kind=' + created.kind);
+      if (serverStatsOk === false) await pushStatsToAccount(true);
     } else {
       ylogError('SYNC', 'could not create wave history playlist');
     }

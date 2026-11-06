@@ -92,7 +92,10 @@
     return-void
 
     :cond_fallback
-    invoke-super {p0}, Landroid/app/Activity;->onBackPressed()V
+    # Minimise like the Home button instead of finishing the Activity.
+    const/4 v0, 0x1
+
+    invoke-virtual {p0, v0}, Landroid/app/Activity;->moveTaskToBack(Z)Z
 
     return-void
 .end method
@@ -110,7 +113,10 @@
 
     :cond_go
     :try_start_0
-    const-string v1, "typeof window.handleAndroidBack === \'function\' ? (window.handleAndroidBack() ? \'true\' : \'false\') : \'handled\'"
+    # Return a JS boolean: evaluateJavascript hands results back JSON-encoded,
+    # so the old string 'true' arrived as "\"true\"" and never matched in
+    # AndroidBackCallback — every back gesture closed the app.
+    const-string v1, "typeof window.handleAndroidBack === \'function\' ? !!window.handleAndroidBack() : false"
 
     new-instance v2, Lcom/ymliberty/app/AndroidBackCallback;
 
