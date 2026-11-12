@@ -9,6 +9,7 @@
   --danger-color: #e63946;
   --nav-base-height: 56px;
   /* WebView's env() does not report the Android nav bar; app.js injects it. */
+  --safe-top: max(env(safe-area-inset-top, 0px), var(--android-status-inset, 0px));
   --safe-bottom: max(env(safe-area-inset-bottom, 0px), var(--android-nav-inset, 0px));
   --nav-height: calc(var(--nav-base-height) + var(--safe-bottom));
   --mini-player-height: 60px;
@@ -2265,7 +2266,7 @@ input[type=range]::-webkit-slider-thumb {
 /* Vibe Top Bar & Search Safe Zone */
 .vibe-top-bar {
   position: absolute;
-  top: max(50px, calc(env(safe-area-inset-top, 0px) + 22px));
+  top: max(50px, calc(var(--safe-top) + 22px));
   right: 20px;
   z-index: 100;
   display: flex;
@@ -2277,7 +2278,7 @@ input[type=range]::-webkit-slider-thumb {
   display: flex;
   align-items: center;
   gap: 14px;
-  padding: max(50px, calc(env(safe-area-inset-top, 0px) + 22px)) 20px 14px !important;
+  padding: max(50px, calc(var(--safe-top) + 22px)) 20px 14px !important;
 }
 
 .search-header-row h1 {
@@ -2505,7 +2506,7 @@ input[type=range]::-webkit-slider-thumb {
   --radius-lg: 22px;
   --control-height: 44px;
   --nav-base-height: 64px;
-  --safe-top: env(safe-area-inset-top, 0px);
+  --safe-top: max(env(safe-area-inset-top, 0px), var(--android-status-inset, 0px));
   /* WebView's env() does not report the Android nav bar; app.js injects it. */
   --safe-bottom: max(env(safe-area-inset-bottom, 0px), var(--android-nav-inset, 0px));
   --nav-height: calc(var(--nav-base-height) + var(--safe-bottom));

@@ -3021,7 +3021,20 @@ function applySystemNavInset() {
     try { inset = Math.max(0, Number(window.AndroidBridge.getNavBarInset()) || 0); } catch (e) {}
   }
   document.documentElement.style.setProperty('--android-nav-inset', inset + 'px');
+  applyStatusBarInset();
 }
+
+// Same story at the top: env(safe-area-inset-top) is 0 in the WebView, so the
+// search / back / collapse buttons sat inside the status bar.
+function applyStatusBarInset() {
+  if (!window.AndroidBridge || typeof window.AndroidBridge.getStatusBarInset !== 'function') return;
+  let inset = 0;
+  try { inset = Math.max(0, Number(window.AndroidBridge.getStatusBarInset()) || 0); } catch (e) {}
+  document.documentElement.style.setProperty('--android-status-inset', inset + 'px');
+}
+applyStatusBarInset();
+window.addEventListener('resize', applyStatusBarInset);
+setTimeout(applyStatusBarInset, 300);
 
 function applySystemNavMode() {
   if (hasNavBridge && typeof window.AndroidBridge.setSystemNavHidden === 'function') {
@@ -4885,8 +4898,8 @@ function getAppVersionInfo() {
   // in AndroidManifest.xml. They previously read 4 / '1.0.3', which made a
   // failed bridge lookup silently claim an ancient version and could hide or
   // fake an update.
-  let versionCode = 54;
-  let versionName = '1.1.34.3';
+  let versionCode = 55;
+  let versionName = '1.1.34.4';
   if (window.AndroidBridge) {
     if (typeof window.AndroidBridge.getVersionCode === 'function') {
       try {
