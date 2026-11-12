@@ -4885,8 +4885,8 @@ function getAppVersionInfo() {
   // in AndroidManifest.xml. They previously read 4 / '1.0.3', which made a
   // failed bridge lookup silently claim an ancient version and could hide or
   // fake an update.
-  let versionCode = 51;
-  let versionName = '1.1.34';
+  let versionCode = 54;
+  let versionName = '1.1.34.3';
   if (window.AndroidBridge) {
     if (typeof window.AndroidBridge.getVersionCode === 'function') {
       try {
@@ -5674,15 +5674,31 @@ function initSwipeGestures() {
 
     let vStartX = 0, vStartY = 0, vStartTime = 0;
     let vIsSwiping = false;
+    let vBlocked = false;
+
+    // A swipe that starts inside a horizontal scroller (album carousel etc.)
+    // belongs to that scroller, not to the swipe-back gesture.
+    const insideHorizontalScroller = (target) => {
+      for (let el = target instanceof Element ? target : null; el && el !== viewEl; el = el.parentElement) {
+        if (el.matches('input[type="range"], [data-horizontal-scroll], [data-no-tab-swipe]')) return true;
+        if (el.scrollWidth > el.clientWidth + 1) {
+          const ox = getComputedStyle(el).overflowX;
+          if (ox === 'auto' || ox === 'scroll') return true;
+        }
+      }
+      return false;
+    };
 
     viewEl.addEventListener('touchstart', (e) => {
       vStartX = e.touches[0].clientX;
       vStartY = e.touches[0].clientY;
       vStartTime = Date.now();
       vIsSwiping = false;
+      vBlocked = e.touches.length > 1 || insideHorizontalScroller(e.target);
     }, { passive: true });
 
     viewEl.addEventListener('touchmove', (e) => {
+      if (vBlocked) return;
       const vDx = e.touches[0].clientX - vStartX;
       const vDy = e.touches[0].clientY - vStartY;
 
