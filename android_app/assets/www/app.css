@@ -719,15 +719,45 @@ input:checked + .slider:before {
   display: flex;
   justify-content: space-between;
   align-items: center;
+  gap: 12px;
+}
+.full-title-row > div {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.full-title-row .like-btn {
+  flex-shrink: 0;
 }
 #full-title {
+  display: flex;
+  align-items: center;
+  min-width: 0;
   font-size: 24px;
   font-weight: 800;
   margin-bottom: 4px;
 }
+#full-title .track-title-text {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+}
+#full-title .explicit-badge,
+#full-title .liberty-badge {
+  flex-shrink: 0;
+}
 #full-artist {
   font-size: 16px;
   color: var(--text-secondary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+#full-artist .artist-link {
+  cursor: pointer;
+}
+#full-artist .artist-link:active {
+  color: var(--text-primary, #fff);
 }
 
 .progress-container {
@@ -3454,4 +3484,46 @@ body::-webkit-scrollbar {
 /* Native-only settings rows stay hidden in a plain browser. */
 .setting-item.hidden {
   display: none;
+}
+
+.full-controls .mode-btn {
+  position: relative;
+  overflow: visible;
+  color: var(--text-secondary);
+  opacity: .5;
+  text-shadow: none;
+  transition: opacity .18s ease, color .18s ease, background .18s ease, border-color .18s ease, transform .18s var(--ease-standard, ease);
+}
+.full-controls .mode-btn.active {
+  color: var(--accent-color);
+  opacity: 1;
+  background: rgba(255, 255, 255, .16);
+  border-color: rgba(255, 255, 255, .34);
+  text-shadow: none;
+}
+.full-controls .mode-btn.active::after {
+  content: '';
+  position: absolute;
+  left: 50%;
+  bottom: -9px;
+  width: 5px;
+  height: 5px;
+  margin-left: -2.5px;
+  border-radius: 50%;
+  background: var(--accent-color);
+}
+.full-controls .repeat-one-mark {
+  display: none;
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  font-size: 9px;
+  font-weight: 800;
+  line-height: 1;
+  color: currentColor;
+  pointer-events: none;
+}
+.full-controls .mode-btn[data-mode="one"] .repeat-one-mark {
+  display: block;
 }

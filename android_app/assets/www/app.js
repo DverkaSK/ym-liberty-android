@@ -136,6 +136,7 @@ const state = {
   queue: [], // Current play queue
   queueIndex: 0,
   queueMode: 'library', // 'library', 'vibe', 'playlist', 'album', 'artist'
+  repeatMode: 'off',
   currentStation: 'user:onyourwave',
   playbackContext: { subtitle: 'ИГРАЕТ ИЗ ВОЛНЫ', title: 'Моя Волна' },
   vibeBatchId: null, // For fetching next vibe tracks
@@ -207,6 +208,13 @@ function navigateToView(targetId) {
   if (typeof startAuraLoop === 'function') startAuraLoop();
 }
 
+function openArtistFromPlayer(artistId) {
+  const fromPlayer = !dom.fullPlayer.classList.contains('translateY-100');
+  dom.fullPlayer.classList.add('translateY-100');
+  openArtist(artistId);
+  if (fromPlayer) state.returnToPlayerDepth = state.viewHistory.length;
+}
+
 function navigateBack() {
   const prevId = state.viewHistory.pop();
   if (prevId && document.getElementById(prevId)) {
@@ -217,6 +225,10 @@ function navigateBack() {
     window.scrollTo(0, 0);
   } else {
     document.querySelector('.nav-btn.active')?.click();
+  }
+  if (state.returnToPlayerDepth != null && state.viewHistory.length < state.returnToPlayerDepth) {
+    state.returnToPlayerDepth = null;
+    dom.fullPlayer.classList.remove('translateY-100');
   }
   syncDynamicBackground();
   if (typeof startAuraLoop === 'function') startAuraLoop();
@@ -235,6 +247,7 @@ function syncDynamicBackground() {
 dom.navBtns.forEach(btn => {
   btn.addEventListener('click', () => {
     state.viewHistory = [];
+    state.returnToPlayerDepth = null;
     dom.navBtns.forEach(b => b.classList.remove('active'));
     btn.classList.add('active');
     
@@ -771,7 +784,7 @@ function renderTracks() {
       state.queue = state.tracks;
       state.queueIndex = state.queue.findIndex(t => t.id === track.id);
       
-      playTrack(track.id, track.title, artist, coverUrl, isExplicit, track.isLiberty);
+      playTrack(track.id, track.title, artist, coverUrl, isExplicit, track.isLiberty, track.track?.artists?.[0]?.id || null, track);
     });
     
     dom.tracksList.appendChild(div);
@@ -803,18 +816,39 @@ async function sendFeedback(type, trackId, duration, trackLengthSeconds) {
 }
 
 // Stream Cache & Gapless Audio Preloader
-const streamCache = new Map(); // id -> Promise<{ streamUrl, ... }>
+const streamCache = new Map();
+const STREAM_CACHE_TTL_MS = 8 * 60 * 1000;
 let preloadedTrack = null;     // { id, streamUrl, ... }
 let preloadPromise = null;
+let playGeneration = 0;
+let pendingLoad = null;
+let pendingResumePosition = 0;
+let vibeContinueRetries = 0;
+
+function isNetworkError(e) {
+  if (!e) return false;
+  if (e.name === 'TypeError') return true;
+  return /failed to fetch|network|load failed|err_internet|err_name_not_resolved/i.test(String(e.message || e));
+}
+let networkRetry = { trackId: null, count: 0 };
+
+function whenOnline(fn, delayMs = 0) {
+  if (navigator.onLine === false) {
+    window.addEventListener('online', () => setTimeout(fn, 1000), { once: true });
+  } else {
+    setTimeout(fn, delayMs);
+  }
+}
 
 async function fetchTrackStream(id, forceRefresh = false, qualityOverride = null) {
   const idStr = String(id);
   const cacheKey = qualityOverride ? `${idStr}:${qualityOverride}` : idStr;
-  if (!forceRefresh && streamCache.has(cacheKey)) {
-    return streamCache.get(cacheKey);
+  const cached = streamCache.get(cacheKey);
+  if (!forceRefresh && cached && Date.now() - cached.at < STREAM_CACHE_TTL_MS) {
+    return cached.promise;
   }
   const p = YandexClient.getStreamUrl(idStr, state.token, qualityOverride);
-  streamCache.set(cacheKey, p);
+  streamCache.set(cacheKey, { promise: p, at: Date.now() });
   try {
     return await p;
   } catch(e) {
@@ -825,7 +859,7 @@ async function fetchTrackStream(id, forceRefresh = false, qualityOverride = null
 
 function getNextTrack() {
   if (!state.queue || state.queue.length === 0) return null;
-  if (state.isRepeat) {
+  if (getRepeatMode() === 'one') {
     return state.queue[state.queueIndex] || state.currentTrack?.track || state.currentTrack;
   }
   if (state.queueMode === 'vibe') {
@@ -842,7 +876,10 @@ function getNextTrack() {
       return state.queue[state.nextShuffleIndex];
     } else {
       let nextIdx = state.queueIndex + 1;
-      if (nextIdx >= state.queue.length) nextIdx = 0; // loop
+      if (nextIdx >= state.queue.length) {
+        if (getRepeatMode() !== 'all') return null;
+        nextIdx = 0;
+      }
       return state.queue[nextIdx];
     }
   }
@@ -903,6 +940,7 @@ async function preloadNextTrack() {
       const data = await fetchTrackStream(nextId);
       if (data && data.streamUrl && preloadedTrack && preloadedTrack.id === nextId) {
         preloadedTrack.streamUrl = data.streamUrl;
+        preloadedTrack.fetchedAt = Date.now();
         preloadPlayer.src = data.streamUrl;
         preloadPlayer.load(); // Buffers beginning of the next track!
       }
@@ -1026,6 +1064,8 @@ function finishCrossfade(outgoingPlayer, incomingPlayer, nextTrackInfo) {
   const temp = activePlayer;
   activePlayer = preloadPlayer;
   preloadPlayer = temp;
+  playGeneration++;
+  pendingLoad = null;
 
   isCrossfading = false;
   preloadedTrack = null;
@@ -1051,8 +1091,8 @@ function finishCrossfade(outgoingPlayer, incomingPlayer, nextTrackInfo) {
     sendFeedback('trackFinished', outgoingTrackInfo.id, Math.floor(outDur || 180), Math.floor(outDur || 0));
   }
 
-  // Advance queue & stats
-  if (state.queueMode === 'vibe') {
+  const repeatOne = getRepeatMode() === 'one';
+  if (!repeatOne && state.queueMode === 'vibe') {
     state.queueIndex++;
     if (state.queueIndex >= state.queue.length) {
       fetchMoreVibeTracks().catch(() => {});
@@ -1064,7 +1104,7 @@ function finishCrossfade(outgoingPlayer, incomingPlayer, nextTrackInfo) {
         addTrackToCloudSync(nextTrackInfo.id, nextTrackInfo.track?.albums?.[0]?.id || 0);
       }
     }
-  } else {
+  } else if (!repeatOne) {
     if (state.isShuffle) {
       state.queueIndex = (state.nextShuffleIndex !== undefined && state.nextShuffleIndex !== null)
         ? state.nextShuffleIndex
@@ -1098,8 +1138,7 @@ async function playNext(isUserSkip = true) {
   lastAudioSampleTime = null;
   lastAudioCurrentTrackId = null;
 
-  // Repeat means we are not really skipping — do not report a false skip to Rotor.
-  if (state.isRepeat) {
+  if (getRepeatMode() === 'one' && !isUserSkip) {
     activePlayer.currentTime = 0;
     activePlayer.play();
     return;
@@ -1129,7 +1168,21 @@ async function playNext(isUserSkip = true) {
       }
     }
     if (state.queueIndex < state.queue.length) {
+      vibeContinueRetries = 0;
       playQueueTrack(state.queue[state.queueIndex]);
+    } else {
+      state.queueIndex = Math.max(0, state.queue.length - 1);
+      vibeContinueRetries++;
+      if (vibeContinueRetries <= 3) {
+        showToast('Не удалось загрузить продолжение волны, пробую ещё раз', 'bi-arrow-repeat');
+        const generation = playGeneration;
+        whenOnline(() => {
+          if (generation === playGeneration && !state.isPlaying && state.queueMode === 'vibe') playNext(false);
+        }, 4000 * vibeContinueRetries);
+      } else {
+        vibeContinueRetries = 0;
+        showToast('Волна не отвечает. Нажмите «Играть», чтобы продолжить', 'bi-exclamation-circle');
+      }
     }
   } else {
     if (state.isShuffle) {
@@ -1139,7 +1192,34 @@ async function playNext(isUserSkip = true) {
       state.nextShuffleIndex = null;
     } else {
       state.queueIndex++;
-      if (state.queueIndex >= state.queue.length) state.queueIndex = 0; // loop
+      if (state.queueIndex >= state.queue.length) {
+        state.queueIndex = 0;
+        if (!isUserSkip && getRepeatMode() !== 'all') {
+          const first = state.queue[0];
+          if (first) {
+            playGeneration++;
+            pendingLoad = null;
+            pendingResumePosition = 0;
+            activePlayer.pause();
+            activePlayer.removeAttribute('src');
+            try { activePlayer.load(); } catch (_) {}
+            updateTrackUI({
+              id: String(first.id),
+              title: first.title,
+              artists: first.artists,
+              coverUri: first.coverUri || first.cover,
+              explicit: first.explicit || first.contentWarning === 'explicit',
+              isLiberty: first.isLiberty,
+              artistId: first.artistId || first.track?.artists?.[0]?.id || null,
+              track: first
+            });
+            state.isPlaying = false;
+            updatePlayButtons();
+            showToast('Очередь закончилась', 'bi-check2-circle');
+          }
+          return;
+        }
+      }
     }
     const track = state.queue[state.queueIndex];
     playQueueTrack(track);
@@ -1209,6 +1289,10 @@ async function playTrack(id, title, artist, cover, explicit, isLiberty, artistId
   const idStr = String(id);
   const trackInfo = { id: idStr, title, artist, cover, explicit, isLiberty, artistId, track: rawTrack };
   updateTrackUI(trackInfo);
+  const generation = ++playGeneration;
+  pendingResumePosition = 0;
+  pendingLoad = { generation, since: Date.now() };
+  playbackRecovery = { trackId: idStr, attempts: 0, busy: false, resumedAt: 0 };
   
   // Set Loading State
   state.isPlaying = false;
@@ -1227,20 +1311,30 @@ async function playTrack(id, title, artist, cover, explicit, isLiberty, artistId
       updatePlayButtons();
       return;
     } catch (e) {
+      if (generation === playGeneration) pendingLoad = null;
       console.error('Offline playback failed:', e);
       showToast('Не удалось открыть загруженный файл', 'bi-exclamation-triangle');
       return;
     }
   }
   
+  if (preloadedTrack && String(preloadedTrack.id) === idStr && preloadedTrack.fetchedAt &&
+      Date.now() - preloadedTrack.fetchedAt > STREAM_CACHE_TTL_MS) {
+    preloadPlayer.pause();
+    preloadPlayer.removeAttribute('src');
+    preloadedTrack = null;
+    preloadPromise = null;
+  }
+
   // Check if this track was preloaded and ready in preloadPlayer
   if (preloadedTrack && String(preloadedTrack.id) === idStr) {
     try {
       if (!preloadedTrack.streamUrl && preloadPromise) {
         await preloadPromise;
       }
+      if (generation !== playGeneration) return;
       
-      if (preloadPlayer.src && preloadedTrack.streamUrl) {
+      if (preloadPlayer.src && preloadedTrack && preloadedTrack.streamUrl) {
         activePlayer.pause();
         activePlayer.currentTime = 0;
         activePlayer.removeAttribute('src');
@@ -1270,23 +1364,51 @@ async function playTrack(id, title, artist, cover, explicit, isLiberty, artistId
     preloadPlayer.removeAttribute('src');
     preloadedTrack = null;
     preloadPromise = null;
+    if (activePlayer.getAttribute('src')) {
+      activePlayer.pause();
+      activePlayer.removeAttribute('src');
+      try { activePlayer.load(); } catch (_) {}
+    }
     
     const data = await fetchTrackStream(idStr);
+    if (generation !== playGeneration) return;
     if (!data || !data.streamUrl) {
+      pendingLoad = null;
       showToast('Ошибка воспроизведения: нет ссылки на поток', 'bi-exclamation-circle');
       return;
     }
     
     activePlayer.src = data.streamUrl;
     await activePlayer.play();
+    if (generation !== playGeneration) return;
+    networkRetry = { trackId: null, count: 0 };
     state.isPlaying = true;
     updatePlayButtons();
     
     setTimeout(preloadNextTrack, 500);
   } catch (e) {
+    if (generation !== playGeneration) return;
+    if (playbackRecovery.busy || (playbackRecovery.trackId === idStr && playbackRecovery.attempts > 0)) return;
+    pendingLoad = null;
     console.error("Play error:", e);
-    showToast('Сетевая ошибка при загрузке трека', 'bi-wifi-off');
-    if (state.queueMode === 'vibe' || state.queue.length > 1) { setTimeout(() => { if (!state.isPlaying) playNext(); }, 1400); }
+    if (isNetworkError(e)) {
+      if (networkRetry.trackId !== idStr) networkRetry = { trackId: idStr, count: 0 };
+      networkRetry.count++;
+      if (networkRetry.count === 1) showToast('Нет соединения. Продолжу, когда сеть появится', 'bi-wifi-off');
+      const delay = Math.min(2000 * Math.pow(2, networkRetry.count - 1), 15000);
+      setTimeout(() => {
+        if (generation === playGeneration && !state.isPlaying) {
+          playTrack(id, title, artist, cover, explicit, isLiberty, artistId, rawTrack);
+        }
+      }, delay);
+      return;
+    }
+    showToast('Не удалось загрузить трек', 'bi-exclamation-circle');
+    if (state.queueMode === 'vibe' || state.queue.length > 1) {
+      setTimeout(() => {
+        if (generation === playGeneration && !state.isPlaying) playNext(false);
+      }, 1400);
+    }
   }
 }
 
@@ -1296,7 +1418,7 @@ function setupMediaSession() {
   try {
     navigator.mediaSession.setActionHandler('play', () => {
       clearNoisyAutoResume();
-      activePlayer.play();
+      resumePlayback();
     });
     navigator.mediaSession.setActionHandler('pause', () => {
       clearNoisyAutoResume();
@@ -1544,7 +1666,7 @@ function slimQueueEntry(t) {
     version: t.version || '',
     artists: typeof t.artists === 'string'
       ? t.artists
-      : (Array.isArray(t.artists) ? t.artists.map(a => (a && a.name) || a).join(', ') : ''),
+      : (Array.isArray(t.artists) ? t.artists.map(a => (a && a.name) || a).join(', ') : (t.artist || '')),
     durationMs: t.durationMs || 0,
     coverUri: t.coverUri || t.cover || '',
     explicit: !!t.explicit,
@@ -1576,7 +1698,7 @@ function savePlaybackState(force = false) {
       vibeBatchId: state.vibeBatchId || null,
       vibeBatchByTrack: state.vibeBatchByTrack || {},
       isShuffle: !!state.isShuffle,
-      isRepeat: !!state.isRepeat,
+      repeatMode: state.repeatMode || 'off',
       timestamp: now
     };
     localStorage.setItem('ym_last_session', JSON.stringify(dataToSave));
@@ -1595,7 +1717,7 @@ function savePlaybackState(force = false) {
         playbackContext: state.playbackContext || null,
         vibeMood: localStorage.getItem('ym_active_vibe_mood') || null,
         isShuffle: !!state.isShuffle,
-        isRepeat: !!state.isRepeat,
+        repeatMode: state.repeatMode || 'off',
         timestamp: Date.now()
       };
       localStorage.setItem('ym_last_session', JSON.stringify(fallback));
@@ -1630,26 +1752,32 @@ function restorePlaybackState() {
       syncVibeMoodUI(savedMood);
     }
     state.isShuffle = !!session.isShuffle;
-    state.isRepeat = !!session.isRepeat;
-
-    const btnShuffle = document.getElementById('btn-full-shuffle');
-    const btnRepeat = document.getElementById('btn-full-repeat');
-    if (btnShuffle) {
-      if (state.isShuffle) btnShuffle.classList.add('active');
-      else btnShuffle.classList.remove('active');
-    }
-    if (btnRepeat) {
-      if (state.isRepeat) btnRepeat.classList.add('active');
-      else btnRepeat.classList.remove('active');
-    }
+    state.repeatMode = ['off', 'all', 'one'].includes(session.repeatMode)
+      ? session.repeatMode
+      : (session.isRepeat ? 'one' : 'off');
+    updateModeButtons();
 
     state.isPlaying = false;
-    const track = session.track;
+    const saved = session.track;
+    let restoredCover = saved.cover || saved.coverUri || PLACEHOLDER_COVER;
+    if (restoredCover.includes('%%')) restoredCover = restoredCover.replace('%%', '400x400');
+    if (!restoredCover.startsWith('http') && restoredCover !== PLACEHOLDER_COVER) restoredCover = `https://${restoredCover}`;
+    const track = {
+      id: String(saved.id),
+      title: saved.title,
+      artist: saved.artist || (typeof saved.artists === 'string' ? saved.artists : '') || 'Unknown',
+      cover: restoredCover,
+      explicit: !!saved.explicit,
+      isLiberty: !!saved.isLiberty,
+      artistId: saved.artistId || null,
+      track: saved
+    };
     updateTrackUI(track);
     updatePlayButtons();
 
     const savedTime = session.currentTime || 0;
     const duration = session.duration || 0;
+    pendingResumePosition = savedTime;
     if (duration > 0 && dom.timeTotal) {
       dom.timeTotal.textContent = formatTime(duration);
     }
@@ -1665,8 +1793,9 @@ function restorePlaybackState() {
     }
 
     // Pre-stage stream URL into activePlayer without autoplaying
+    const restoreGeneration = playGeneration;
     fetchTrackStream(track.id).then(data => {
-      if (data && data.streamUrl) {
+      if (data && data.streamUrl && restoreGeneration === playGeneration && !activePlayer.getAttribute('src')) {
         activePlayer.src = data.streamUrl;
         activePlayer.currentTime = savedTime;
       }
@@ -1684,8 +1813,46 @@ document.addEventListener('visibilitychange', () => {
   if (document.visibilityState === 'hidden') savePlaybackState(true);
 });
 
+function getTrackArtistList(info) {
+  if (!info) return [];
+  const candidates = [info.track?.artists, info.track?.track?.artists, info.artists];
+  for (const list of candidates) {
+    if (Array.isArray(list) && list.length && list[0] && typeof list[0] === 'object') {
+      const artists = list.filter(a => a && a.name).map(a => ({ id: a.id || null, name: a.name }));
+      if (artists.length) return artists;
+    }
+  }
+  const joined = info.artist || (typeof info.artists === 'string' ? info.artists : '');
+  const names = String(joined || '').split(', ').map(n => n.trim()).filter(n => n && n !== 'Unknown');
+  return names.map((name, i) => ({ id: i === 0 ? (info.artistId || null) : null, name }));
+}
+
+function renderFullArtistLinks(trackInfo) {
+  const artists = getTrackArtistList(trackInfo);
+  dom.fullArtist._artists = artists;
+  if (!artists.length) {
+    dom.fullArtist.textContent = trackInfo.artist || '';
+    return;
+  }
+  dom.fullArtist.innerHTML = artists
+    .map((a, i) => `<span class="artist-link" data-artist-index="${i}">${escapeHtml(a.name)}</span>`)
+    .join(', ');
+}
+
 function updateTrackUI(trackInfo) {
+  if (!trackInfo.cover) {
+    let c = trackInfo.coverUri || PLACEHOLDER_COVER;
+    if (c.includes('%%')) c = c.replace('%%', '400x400');
+    if (!c.startsWith('http') && c !== PLACEHOLDER_COVER) c = `https://${c}`;
+    trackInfo.cover = c;
+  }
+  if (!trackInfo.artist) {
+    trackInfo.artist = typeof trackInfo.artists === 'string'
+      ? trackInfo.artists
+      : (Array.isArray(trackInfo.artists) ? trackInfo.artists.map(a => (a && a.name) || a).join(', ') : '') || 'Unknown';
+  }
   state.currentTrack = trackInfo;
+  updateModeButtons();
   
   const badgeHtml = trackInfo.isLiberty ? `<span class="liberty-badge"><i class="bi bi-gem"></i></span>` : (trackInfo.explicit ? `<span class="explicit-badge">E</span>` : '');
   dom.miniTitle.innerHTML = `<span class="track-title-text">${escapeHtml(trackInfo.title)}</span>${badgeHtml}`;
@@ -1693,7 +1860,7 @@ function updateTrackUI(trackInfo) {
   dom.miniCover.src = trackInfo.cover;
   
   dom.fullTitle.innerHTML = `<span class="track-title-text">${escapeHtml(trackInfo.title)}</span>${badgeHtml}`;
-  dom.fullArtist.textContent = trackInfo.artist;
+  renderFullArtistLinks(trackInfo);
   
   if (trackInfo.cover.includes('1000x1000')) {
     dom.fullCover.src = trackInfo.cover;
@@ -1823,6 +1990,45 @@ if (dom.btnLike) {
 // playback or starts a fresh session, and the icon has to promise the same
 // thing. A track from a library/album/playlist must not paint the Wave button
 // as "now playing".
+const REPEAT_MODE_TOASTS = {
+  off: 'Повтор выключен',
+  all: 'Повтор очереди',
+  one: 'Повтор трека'
+};
+const REPEAT_MODE_LABELS = {
+  off: 'Повтор: выключен',
+  all: 'Повтор: вся очередь',
+  one: 'Повтор: этот трек'
+};
+
+function getRepeatMode() {
+  const mode = state.repeatMode || 'off';
+  if (mode === 'all' && state.queueMode === 'vibe') return 'off';
+  return mode;
+}
+
+function updateModeButtons() {
+  const repeatBtn = document.getElementById('btn-full-repeat');
+  if (repeatBtn) {
+    const mode = getRepeatMode();
+    repeatBtn.dataset.mode = mode;
+    repeatBtn.classList.toggle('active', mode !== 'off');
+    repeatBtn.setAttribute('aria-pressed', mode !== 'off' ? 'true' : 'false');
+    repeatBtn.setAttribute('aria-label', REPEAT_MODE_LABELS[mode]);
+    repeatBtn.title = REPEAT_MODE_LABELS[mode];
+  }
+  const shuffleBtn = document.getElementById('btn-full-shuffle');
+  if (shuffleBtn) {
+    shuffleBtn.classList.toggle('active', !!state.isShuffle);
+    shuffleBtn.setAttribute('aria-pressed', state.isShuffle ? 'true' : 'false');
+    const label = state.isShuffle
+      ? 'Перемешивание: включено'
+      : 'Перемешивание: выключено';
+    shuffleBtn.setAttribute('aria-label', label);
+    shuffleBtn.title = label;
+  }
+}
+
 function isPlainVibePlaying() {
   return state.queueMode === 'vibe'
     && (!state.currentStation || state.currentStation === 'user:onyourwave')
@@ -1909,6 +2115,198 @@ function bindAudioPlayerEvents(player) {
 }
 bindAudioPlayerEvents(playerA);
 bindAudioPlayerEvents(playerB);
+
+const MAX_RECOVERIES_PER_TRACK = 2;
+const STALL_TIMEOUT_MS = 25000;
+const LOAD_TIMEOUT_MS = 30000;
+let playbackRecovery = { trackId: null, attempts: 0, busy: false, resumedAt: 0 };
+
+function waitForMetadata(player, timeoutMs = 15000) {
+  return new Promise(resolve => {
+    if (player.readyState >= 1) return resolve(true);
+    let timer = null;
+    const finish = (ok) => {
+      clearTimeout(timer);
+      player.removeEventListener('loadedmetadata', onOk);
+      player.removeEventListener('error', onErr);
+      resolve(ok);
+    };
+    const onOk = () => finish(true);
+    const onErr = () => finish(false);
+    timer = setTimeout(() => finish(false), timeoutMs);
+    player.addEventListener('loadedmetadata', onOk);
+    player.addEventListener('error', onErr);
+  });
+}
+
+async function reloadCurrentStream(position, autoplay) {
+  const track = state.currentTrack;
+  if (!track || !track.id) return false;
+  const generation = playGeneration;
+  let url = track.track?.offlineUrl || null;
+  if (!url) {
+    try {
+      const data = await fetchTrackStream(String(track.id), true);
+      url = data && data.streamUrl;
+    } catch (e) {
+      console.warn('[Recovery] stream lookup failed:', e);
+      return isNetworkError(e) ? 'network' : false;
+    }
+  }
+  if (!url || generation !== playGeneration) return false;
+
+  const player = activePlayer;
+  player.src = url;
+  if (position > 1) {
+    const ok = await waitForMetadata(player);
+    if (generation !== playGeneration || player !== activePlayer) return false;
+    if (!ok) return false;
+    try {
+      const dur = player.duration;
+      player.currentTime = (dur && isFinite(dur)) ? Math.min(position, Math.max(dur - 1, 0)) : position;
+    } catch (e) {}
+  }
+  if (!autoplay) return true;
+  try {
+    await player.play();
+    return generation === playGeneration;
+  } catch (e) {
+    console.warn('[Recovery] play() failed:', e);
+    return false;
+  }
+}
+
+async function recoverPlayback(reason) {
+  const track = state.currentTrack;
+  if (!track || !track.id || playbackRecovery.busy) return;
+  const idStr = String(track.id);
+  if (playbackRecovery.trackId !== idStr) {
+    playbackRecovery = { trackId: idStr, attempts: 0, busy: false, resumedAt: 0 };
+  }
+  const position = activePlayer.currentTime || pendingResumePosition || 0;
+  const generation = playGeneration;
+  console.warn(`[Recovery] ${reason} on track ${idStr} at ${Math.floor(position)}s (attempt ${playbackRecovery.attempts + 1})`);
+
+  if (playbackRecovery.attempts >= MAX_RECOVERIES_PER_TRACK) {
+    pendingLoad = null;
+    state.isPlaying = false;
+    updatePlayButtons();
+    const canAdvance = state.queueMode === 'vibe' || state.queue.length > 1;
+    showToast(canAdvance ? 'Трек не загружается, переключаю дальше' : 'Не удалось загрузить трек', 'bi-exclamation-circle');
+    if (canAdvance) whenOnline(() => { if (generation === playGeneration) playNext(false); });
+    return;
+  }
+
+  playbackRecovery.attempts++;
+  playbackRecovery.busy = true;
+  pendingResumePosition = position;
+  let ok = false;
+  try {
+    if (navigator.onLine === false) {
+      await new Promise(resolve => window.addEventListener('online', resolve, { once: true }));
+      await new Promise(resolve => setTimeout(resolve, 1000));
+      if (generation !== playGeneration) return;
+    }
+    ok = await reloadCurrentStream(position, true);
+  } finally {
+    playbackRecovery.busy = false;
+  }
+  if (generation !== playGeneration) return;
+  if (ok === true) {
+    pendingResumePosition = 0;
+    playbackRecovery.resumedAt = activePlayer.currentTime || position;
+    return;
+  }
+  let delay = 1500;
+  if (ok === 'network') {
+    playbackRecovery.attempts--;
+    playbackRecovery.networkFails = (playbackRecovery.networkFails || 0) + 1;
+    if (playbackRecovery.networkFails === 1) showToast('Нет соединения. Продолжу, когда сеть появится', 'bi-wifi-off');
+    delay = Math.min(2000 * Math.pow(2, playbackRecovery.networkFails - 1), 15000);
+  }
+  playbackRecovery.retryPending = true;
+  const recovery = playbackRecovery;
+  setTimeout(() => {
+    recovery.retryPending = false;
+    if (generation === playGeneration) recoverPlayback(reason);
+  }, delay);
+}
+
+function handlePlayerError(e) {
+  const player = e.target;
+  const err = player.error;
+  if (!player.getAttribute('src')) return;
+  if (err && err.code === 1) return;
+  console.warn('[Audio] error', err && err.code, err && err.message);
+
+  if (player !== activePlayer) {
+    if (isCrossfading) resetCrossfadeState();
+    preloadedTrack = null;
+    preloadPromise = null;
+    try { player.removeAttribute('src'); } catch (_) {}
+    return;
+  }
+  if (playbackRecovery.busy) return;
+  if (isCrossfading) resetCrossfadeState();
+
+  if (state.isPlaying || pendingLoad) {
+    recoverPlayback('error');
+  } else {
+    pendingResumePosition = player.currentTime || pendingResumePosition;
+    try { player.removeAttribute('src'); } catch (_) {}
+  }
+}
+playerA.addEventListener('error', handlePlayerError);
+playerB.addEventListener('error', handlePlayerError);
+[playerA, playerB].forEach(player => {
+  player.addEventListener('playing', (e) => {
+    if (e.target === activePlayer) pendingLoad = null;
+  });
+});
+
+let stallWatch = { pos: -1, since: 0 };
+setInterval(() => {
+  const now = Date.now();
+
+  if (pendingLoad && pendingLoad.generation === playGeneration && !state.isPlaying &&
+      now - pendingLoad.since > LOAD_TIMEOUT_MS && !playbackRecovery.busy && !playbackRecovery.retryPending) {
+    pendingLoad.since = now;
+    recoverPlayback('load timeout');
+    return;
+  }
+
+  if (!state.isPlaying || isCrossfading || playbackRecovery.busy || playbackRecovery.retryPending || !activePlayer.getAttribute('src')) {
+    stallWatch = { pos: -1, since: 0 };
+    return;
+  }
+  const pos = activePlayer.currentTime || 0;
+  if (Math.abs(pos - stallWatch.pos) > 0.2) {
+    stallWatch = { pos, since: now };
+    if (playbackRecovery.attempts && pos - playbackRecovery.resumedAt > 30) playbackRecovery.attempts = 0;
+    return;
+  }
+  if (stallWatch.since && now - stallWatch.since > STALL_TIMEOUT_MS) {
+    stallWatch = { pos: -1, since: 0 };
+    recoverPlayback('stall');
+  }
+}, 5000);
+
+async function resumePlayback() {
+  if (!state.currentTrack || !state.currentTrack.id) return false;
+  if (activePlayer.getAttribute('src') && !activePlayer.error) {
+    try {
+      await activePlayer.play();
+      return true;
+    } catch (e) {
+      if (e && e.name === 'NotAllowedError') return false;
+      console.warn('[Resume] play() failed, reloading stream:', e);
+    }
+  }
+  const position = activePlayer.currentTime || pendingResumePosition || 0;
+  const ok = await reloadCurrentStream(position, true);
+  if (ok) pendingResumePosition = 0;
+  return ok;
+}
 
 // Format time utility
 function formatTime(seconds) {
@@ -2087,7 +2485,8 @@ async function startVibe() {
   if (state.queueMode === 'vibe' && (!state.currentStation || state.currentStation === 'user:onyourwave') && state.queue.length > 0 && state.queueIndex < state.queue.length) {
     // If already in standard Vibe mode, just toggle play/pause
     if (state.isPlaying) return activePlayer.pause();
-    return activePlayer.play();
+    dom.vibePlayBtn.innerHTML = '<i class="bi bi-hourglass-split"></i>';
+    if (await resumePlayback()) return;
   }
   
   // Otherwise, stop current track and start a fresh Vibe session
@@ -2279,7 +2678,7 @@ function handlePlayToggle(e) {
   if (state.isPlaying) {
     activePlayer.pause();
   } else {
-    activePlayer.play();
+    resumePlayback().then(ok => { if (!ok) updatePlayButtons(); });
   }
 }
 
@@ -2311,23 +2710,36 @@ const btnShuffle = document.getElementById('btn-full-shuffle');
 const btnRepeat = document.getElementById('btn-full-repeat');
 if (btnShuffle) btnShuffle.addEventListener('click', () => {
   state.isShuffle = !state.isShuffle;
-  if (state.isShuffle) {
-    btnShuffle.classList.add('active');
-  } else {
-    btnShuffle.classList.remove('active');
-  }
   state.nextShuffleIndex = null;
+  updateModeButtons();
+  showToast(state.isShuffle ? 'Перемешивание включено' : 'Перемешивание выключено', 'bi-shuffle');
+  dropStalePreload();
   preloadNextTrack();
+  savePlaybackState(true);
 });
 if (btnRepeat) btnRepeat.addEventListener('click', () => {
-  state.isRepeat = !state.isRepeat;
-  if (state.isRepeat) {
-    btnRepeat.classList.add('active');
-  } else {
-    btnRepeat.classList.remove('active');
-  }
+  const current = getRepeatMode();
+  const cycle = state.queueMode === 'vibe' ? ['off', 'one'] : ['off', 'all', 'one'];
+  const next = cycle[(cycle.indexOf(current) + 1) % cycle.length];
+  state.repeatMode = next;
+  updateModeButtons();
+  showToast(REPEAT_MODE_TOASTS[next], next === 'one' ? 'bi-repeat-1' : 'bi-repeat');
+  dropStalePreload();
   preloadNextTrack();
+  savePlaybackState(true);
 });
+
+updateModeButtons();
+
+function dropStalePreload() {
+  const wanted = getNextTrack();
+  if (preloadedTrack && (!wanted || String(wanted.id) !== String(preloadedTrack.id))) {
+    preloadPlayer.pause();
+    preloadPlayer.removeAttribute('src');
+    preloadedTrack = null;
+    preloadPromise = null;
+  }
+}
 
 // Search Logic
 const searchInput = document.getElementById('search-input');
@@ -2418,7 +2830,7 @@ function renderSearchResults(data) {
         state.queueMode = 'library';
         state.queue = tracks.map(tr => tr.track);
         state.queueIndex = tracks.findIndex(tr => tr.id === t.id);
-        playTrack(t.id, t.title, t.artists, t.coverUri || PLACEHOLDER_COVER);
+        playTrack(t.id, t.title, t.artists, t.coverUri || PLACEHOLDER_COVER, t.explicit, t.isLiberty, t.track?.artists?.[0]?.id || null, t);
       });
       
       searchResults.appendChild(div);
@@ -2711,7 +3123,7 @@ async function openArtist(id) {
         updatePlaybackContextHeader('ТРЕКИ АРТИСТА', artistPageName.textContent || 'Артист');
         state.queue = currentArtistTracks.map(tr => ({ ...(tr.track || {}), id: tr.id, title: tr.title, isLiberty: tr.isLiberty, explicit: tr.explicit, artists: tr.artists, coverUri: tr.coverUri }));
         state.queueIndex = i;
-        playTrack(t.id, t.title, t.artists, t.coverUri || PLACEHOLDER_COVER, t.explicit, t.isLiberty);
+        playTrack(t.id, t.title, t.artists, t.coverUri || PLACEHOLDER_COVER, t.explicit, t.isLiberty, t.track?.artists?.[0]?.id || null, t);
       });
 
       artistTracksList.appendChild(div);
@@ -2731,7 +3143,7 @@ if (btnArtistPlay) {
       state.queue = currentArtistTracks.map(tr => ({ ...(tr.track || {}), id: tr.id, title: tr.title, isLiberty: tr.isLiberty, explicit: tr.explicit, artists: tr.artists, coverUri: tr.coverUri }));
       state.queueIndex = 0;
       const t = currentArtistTracks[0];
-      playTrack(t.id, t.title, t.artists, t.coverUri || PLACEHOLDER_COVER, t.explicit, t.isLiberty);
+      playTrack(t.id, t.title, t.artists, t.coverUri || PLACEHOLDER_COVER, t.explicit, t.isLiberty, t.track?.artists?.[0]?.id || null, t);
     }
   });
 }
@@ -2971,20 +3383,20 @@ if (dom.fullArtist) {
   dom.fullArtist.title = 'Перейти к артисту';
   dom.fullArtist.addEventListener('click', async (e) => {
     e.stopPropagation();
-    const current = state.currentTrack?.track || state.currentTrack || state.queue[state.queueIndex];
-    let artistId = state.currentTrack?.artistId ||
-                   current?.artistId ||
-                   current?.track?.artists?.[0]?.id ||
-                   (Array.isArray(current?.artists) ? current.artists[0]?.id : null);
+    const artists = dom.fullArtist._artists || [];
+    const link = e.target.closest ? e.target.closest('.artist-link') : null;
+    const target = (link && artists[Number(link.dataset.artistIndex)]) || artists[0] || null;
+    let artistId = target?.id || null;
 
     if (!artistId) {
-      const artistName = dom.fullArtist.textContent.trim() || state.currentTrack?.artist;
+      const artistName = target?.name || dom.fullArtist.textContent.trim() || state.currentTrack?.artist;
       if (artistName && artistName !== 'Unknown') {
         try {
           const sData = await YandexClient.search(artistName, state.token);
-          if (sData.artists && sData.artists.length > 0) {
-            artistId = sData.artists[0].id;
-          }
+          const found = sData.artists || [];
+          const exact = found.find(a => String(a.name || '').toLowerCase() === artistName.toLowerCase());
+          artistId = (exact || found[0])?.id || null;
+          if (artistId && target) target.id = artistId;
         } catch (err) {
           console.error("Search artist fallback error:", err);
         }
@@ -2992,8 +3404,9 @@ if (dom.fullArtist) {
     }
 
     if (artistId) {
-      dom.fullPlayer.classList.add('translateY-100');
-      openArtist(artistId);
+      openArtistFromPlayer(artistId);
+    } else {
+      showToast('Не удалось найти исполнителя', 'bi-exclamation-circle');
     }
   });
 }
@@ -3098,7 +3511,7 @@ dom.fullPlayer.classList.add('translateY-100');
 
 // Setup System Media Controls & Restore Last Session
 setupMediaSession();
-restorePlaybackState();
+queueMicrotask(restorePlaybackState);
 
 // Auto Login
 if (state.token) {
@@ -3697,8 +4110,7 @@ function openActionSheet(track) {
       asBtnArtist.style.display = 'flex';
       asBtnArtist.onclick = () => {
         closeActionSheet();
-        openArtist(artistId);
-        dom.fullPlayer.classList.add('translateY-100');
+        openArtistFromPlayer(artistId);
       };
     } else {
       asBtnArtist.style.display = 'none';
@@ -4898,8 +5310,8 @@ function getAppVersionInfo() {
   // in AndroidManifest.xml. They previously read 4 / '1.0.3', which made a
   // failed bridge lookup silently claim an ancient version and could hide or
   // fake an update.
-  let versionCode = 55;
-  let versionName = '1.1.34.4';
+  let versionCode = 56;
+  let versionName = '1.1.34.5';
   if (window.AndroidBridge) {
     if (typeof window.AndroidBridge.getVersionCode === 'function') {
       try {
